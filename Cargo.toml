@@ -1,0 +1,13 @@
+[package]
+name = "rumoca-sil"
+version = "0.1.0"
+edition = "2021"
+description = "Quadrotor SIL plant simulator using Rumoca"
+
+[dependencies]
+rumoca = { path = "/home/micah/Research/development/rumoca/rumoca/crates/rumoca" }
+rumoca-sim = { path = "/home/micah/Research/development/rumoca/rumoca/crates/rumoca-sim" }
+anyhow = "1"
+serde_json = "1"
+tungstenite = "0.26"
+gilrs = "0.11"
