@@ -24,6 +24,7 @@ Open http://localhost:8080 for the Three.js visualization.
 | `SIL_UDP_LISTEN` | (none) | UDP address to listen for motor_output packets |
 | `SIL_UDP_SEND` | (none) | UDP address to send flight_snapshot packets |
 | `SIL_DT` | `0.004` | Simulation timestep in seconds (250 Hz) |
+| `SIL_TEST` | (none) | Set to `1` for scripted test flight (arm, hover, maneuver, land, repeat) |
 
 Both `SIL_UDP_LISTEN` and `SIL_UDP_SEND` must be set to enable UDP mode.
 Without them, the simulator runs in self-test mode (constant hover RPMs).

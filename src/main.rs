@@ -20,6 +20,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use gilrs::{Axis, Button, Gilrs};
 use rumoca_sim::{SimStepper, StepperOptions};
 use tungstenite::{accept, Message};
@@ -220,94 +221,290 @@ mod cerebri_fb {
 }
 
 // ===========================================================================
-// Gamepad input → RC channels
+// Input → RC channels (gamepad, keyboard, or test sequence)
 // ===========================================================================
 
 const RC_CENTER: i32 = 1500;
 const RC_MIN: i32 = 1000;
 const RC_MAX: i32 = 2000;
 
-struct GamepadState {
+/// Unified input source for RC channels.
+struct InputState {
     gilrs: Gilrs,
     rc: [i32; 16],
     armed: bool,
-    arm_prev: bool,           // for edge detection on arm toggle
-    arm_last_toggle: Instant, // debounce: ignore toggles within 500ms
-    throttle: f64,            // virtual throttle 0.0–1.0 (persists like a real RC stick)
-    last_poll: Instant,       // for delta-time calculation
+    arm_prev: bool,
+    arm_last_toggle: Instant,
+    throttle: f64,
+    last_poll: Instant,
+    mode: InputMode,
+    // Keyboard: track which keys are held
+    kb_roll: f64,
+    kb_pitch: f64,
+    kb_yaw: f64,
+    kb_throttle_input: f64,
+    // Test sequence state
+    test_start: Instant,
 }
 
-impl GamepadState {
-    fn new() -> Self {
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InputMode {
+    Gamepad,
+    Keyboard,
+    Test,
+}
+
+impl std::fmt::Display for InputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InputMode::Gamepad => write!(f, "gamepad"),
+            InputMode::Keyboard => write!(f, "keyboard"),
+            InputMode::Test => write!(f, "test"),
+        }
+    }
+}
+
+// Test sequence: time-based scripted flight
+// Each step: (start_time_sec, throttle_0_to_1, roll, pitch, yaw, armed)
+const TEST_SEQUENCE: &[(f64, f64, f64, f64, f64, bool)] = &[
+    //  time  throttle  roll  pitch  yaw   armed
+    (0.0,    0.0,      0.0,  0.0,   0.0,  false),  // ground, disarmed
+    (2.0,    0.0,      0.0,  0.0,   0.0,  true),   // arm (throttle low)
+    (3.0,    0.50,     0.0,  0.0,   0.0,  true),   // ramp to hover
+    (5.0,    0.52,     0.0,  0.0,   0.0,  true),   // steady hover
+    (8.0,    0.52,     0.0,  0.15,  0.0,  true),   // gentle pitch forward
+    (10.0,   0.52,     0.0,  0.0,   0.0,  true),   // level out
+    (12.0,   0.52,     0.15, 0.0,   0.0,  true),   // gentle roll right
+    (14.0,   0.52,     0.0,  0.0,   0.0,  true),   // level out
+    (16.0,   0.52,     0.0,  0.0,   0.2,  true),   // yaw right
+    (18.0,   0.52,     0.0,  0.0,   0.0,  true),   // stop yaw
+    (20.0,   0.30,     0.0,  0.0,   0.0,  true),   // descend
+    (23.0,   0.0,      0.0,  0.0,   0.0,  true),   // cut throttle
+    (25.0,   0.0,      0.0,  0.0,   0.0,  false),  // disarm
+    (30.0,   0.0,      0.0,  0.0,   0.0,  false),  // hold (sequence restarts)
+];
+
+impl InputState {
+    fn new(mode: InputMode) -> Self {
         let gilrs = Gilrs::new().expect("Failed to initialize gilrs");
         for (_id, gamepad) in gilrs.gamepads() {
             eprintln!("Gamepad found: {} ({})", gamepad.name(), gamepad.os_name());
         }
-        if gilrs.gamepads().count() == 0 {
-            eprintln!("No gamepad detected — RC will default to centered/disarmed");
-        }
+
+        let effective_mode = match mode {
+            InputMode::Test => {
+                eprintln!("[input] Test sequence mode");
+                InputMode::Test
+            }
+            InputMode::Gamepad | InputMode::Keyboard => {
+                if gilrs.gamepads().count() > 0 {
+                    eprintln!("[input] Using gamepad");
+                    InputMode::Gamepad
+                } else {
+                    eprintln!("[input] No gamepad detected — using keyboard");
+                    eprintln!("[input] Keyboard controls:");
+                    eprintln!("  Up/Down    — throttle up/down");
+                    eprintln!("  Left/Right — yaw left/right");
+                    eprintln!("  W/S        — pitch forward/back");
+                    eprintln!("  A/D        — roll left/right");
+                    eprintln!("  Space      — arm/disarm toggle");
+                    eprintln!("  Q          — quit");
+                    if crossterm::terminal::enable_raw_mode().is_err() {
+                        eprintln!("[input] Warning: could not enable raw mode (not a tty?)");
+                    }
+                    InputMode::Keyboard
+                }
+            }
+        };
+
         let mut rc = [RC_CENTER; 16];
-        rc[2] = RC_MIN; // throttle at minimum
-        rc[4] = RC_MIN; // arm switch off
+        rc[2] = RC_MIN;
+        rc[4] = RC_MIN;
         Self {
             gilrs,
             rc,
             armed: false,
             arm_prev: false,
-            arm_last_toggle: Instant::now(),
+            arm_last_toggle: Instant::now() - Duration::from_secs(10),
             throttle: 0.0,
             last_poll: Instant::now(),
+            mode: effective_mode,
+            kb_roll: 0.0,
+            kb_pitch: 0.0,
+            kb_yaw: 0.0,
+            kb_throttle_input: 0.0,
+            test_start: Instant::now(),
         }
     }
 
     fn poll(&mut self) {
-        // Drain events
+        match self.mode {
+            InputMode::Gamepad => self.poll_gamepad(),
+            InputMode::Keyboard => self.poll_keyboard(),
+            InputMode::Test => self.poll_test(),
+        }
+    }
+
+    fn poll_gamepad(&mut self) {
         while self.gilrs.next_event().is_some() {}
 
         let Some((_id, gamepad)) = self.gilrs.gamepads().next() else {
-            // No gamepad — keep defaults
             return;
         };
 
-        // Map axes to RC channels (microseconds)
-        // gilrs axes return -1.0 to 1.0
-        self.rc[0] = axis_to_rc(gamepad.value(Axis::RightStickX), RC_CENTER, 500);  // roll
-        self.rc[1] = axis_to_rc(gamepad.value(Axis::RightStickY), RC_CENTER, -500); // pitch (inverted)
-        self.rc[3] = axis_to_rc(gamepad.value(Axis::LeftStickX), RC_CENTER, 500);   // yaw
+        self.rc[0] = axis_to_rc(gamepad.value(Axis::RightStickX), RC_CENTER, 500);
+        self.rc[1] = axis_to_rc(gamepad.value(Axis::RightStickY), RC_CENTER, -500);
+        self.rc[3] = axis_to_rc(gamepad.value(Axis::LeftStickX), RC_CENTER, 500);
 
-        // Throttle: virtual stick — acts like a real RC throttle that stays in place.
-        // Push up to increase, push down to decrease, release to hold.
         let dt = self.last_poll.elapsed().as_secs_f64();
         self.last_poll = Instant::now();
         let stick_y = gamepad.value(Axis::LeftStickY) as f64;
         let deadzone = 0.1;
         let input = if stick_y.abs() < deadzone { 0.0 } else { stick_y };
-        // Full range in ~1.5 seconds at full deflection
         self.throttle = (self.throttle + input * 0.7 * dt).clamp(0.0, 1.0);
         self.rc[2] = (RC_MIN as f64 + self.throttle * (RC_MAX - RC_MIN) as f64).round() as i32;
 
-        // Arm toggle: Start button, rising edge, only when throttle is low
-        // 500ms debounce to prevent DualSense double-register
         let arm_btn = gamepad.is_pressed(Button::Start);
         if arm_btn && !self.arm_prev && self.arm_last_toggle.elapsed() > Duration::from_millis(500) {
             if self.rc[2] <= 1050 {
                 self.armed = !self.armed;
                 self.arm_last_toggle = Instant::now();
                 eprintln!(
-                    "[gamepad] {}",
+                    "\r[gamepad] {}",
                     if self.armed { "ARMED" } else { "DISARMED" }
                 );
-            } else {
-                eprintln!("[gamepad] Cannot arm: throttle not at minimum ({}us)", self.rc[2]);
             }
         }
         self.arm_prev = arm_btn;
+        self.rc[4] = if self.armed { RC_MAX } else { RC_MIN };
+    }
+
+    fn poll_keyboard(&mut self) {
+        let dt = self.last_poll.elapsed().as_secs_f64();
+        self.last_poll = Instant::now();
+
+        // Decay axes toward zero when keys are released
+        let decay = 0.85_f64.powf(dt / 0.016);
+        self.kb_roll *= decay;
+        self.kb_pitch *= decay;
+        self.kb_yaw *= decay;
+        self.kb_throttle_input *= decay;
+
+        // Drain all pending key events (only act on Press/Repeat, ignore Release)
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            match event::read() {
+                Ok(Event::Key(KeyEvent { code, modifiers, kind, .. })) => {
+                    if kind == crossterm::event::KeyEventKind::Release {
+                        continue;
+                    }
+                    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+                    match code {
+                        KeyCode::Char('c') if ctrl => {
+                            crossterm::terminal::disable_raw_mode().ok();
+                            std::process::exit(0);
+                        }
+                        KeyCode::Char('q') => {
+                            crossterm::terminal::disable_raw_mode().ok();
+                            std::process::exit(0);
+                        }
+                        // Arrow keys: throttle and yaw
+                        KeyCode::Up => self.kb_throttle_input = 1.0,
+                        KeyCode::Down => self.kb_throttle_input = -1.0,
+                        KeyCode::Left => self.kb_yaw = -0.6,
+                        KeyCode::Right => self.kb_yaw = 0.6,
+                        // WASD: pitch and roll
+                        KeyCode::Char('w') => self.kb_pitch = -0.6,
+                        KeyCode::Char('s') => self.kb_pitch = 0.6,
+                        KeyCode::Char('a') => self.kb_roll = -0.6,
+                        KeyCode::Char('d') => self.kb_roll = 0.6,
+                        // Arm/disarm toggle (500ms debounce to prevent double-toggle)
+                        KeyCode::Char(' ') => {
+                            if self.arm_last_toggle.elapsed() > Duration::from_millis(500) {
+                                self.armed = !self.armed;
+                                self.arm_last_toggle = Instant::now();
+                                eprint!(
+                                    "\r[keyboard] {}                    \r",
+                                    if self.armed { "ARMED" } else { "DISARMED" }
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Apply throttle ramp
+        self.throttle = (self.throttle + self.kb_throttle_input * 0.7 * dt).clamp(0.0, 1.0);
+        self.rc[2] = (RC_MIN as f64 + self.throttle * (RC_MAX - RC_MIN) as f64).round() as i32;
+
+        // Apply axes
+        self.rc[0] = (RC_CENTER as f64 + self.kb_roll * 500.0).round().clamp(RC_MIN as f64, RC_MAX as f64) as i32;
+        self.rc[1] = (RC_CENTER as f64 + self.kb_pitch * 500.0).round().clamp(RC_MIN as f64, RC_MAX as f64) as i32;
+        self.rc[3] = (RC_CENTER as f64 + self.kb_yaw * 500.0).round().clamp(RC_MIN as f64, RC_MAX as f64) as i32;
 
         self.rc[4] = if self.armed { RC_MAX } else { RC_MIN };
     }
 
+    fn poll_test(&mut self) {
+        let t = self.test_start.elapsed().as_secs_f64();
+        let total_duration = TEST_SEQUENCE.last().unwrap().0;
+
+        // Loop the sequence
+        let t = t % total_duration;
+
+        // Find the current and next keyframe
+        let mut cur = &TEST_SEQUENCE[0];
+        let mut next = &TEST_SEQUENCE[0];
+        for i in 0..TEST_SEQUENCE.len() - 1 {
+            if t >= TEST_SEQUENCE[i].0 && t < TEST_SEQUENCE[i + 1].0 {
+                cur = &TEST_SEQUENCE[i];
+                next = &TEST_SEQUENCE[i + 1];
+                break;
+            }
+        }
+
+        // Linearly interpolate between keyframes
+        let span = next.0 - cur.0;
+        let frac = if span > 0.0 { (t - cur.0) / span } else { 0.0 };
+        let lerp = |a: f64, b: f64| a + (b - a) * frac;
+
+        let throttle = lerp(cur.1, next.1);
+        let roll = lerp(cur.2, next.2);
+        let pitch = lerp(cur.3, next.3);
+        let yaw = lerp(cur.4, next.4);
+        self.armed = cur.5;
+
+        self.throttle = throttle;
+        self.rc[2] = (RC_MIN as f64 + throttle * (RC_MAX - RC_MIN) as f64).round() as i32;
+        self.rc[0] = (RC_CENTER as f64 + roll * 500.0).round() as i32;
+        self.rc[1] = (RC_CENTER as f64 + pitch * 500.0).round() as i32;
+        self.rc[3] = (RC_CENTER as f64 + yaw * 500.0).round() as i32;
+        self.rc[4] = if self.armed { RC_MAX } else { RC_MIN };
+    }
+
     fn is_connected(&self) -> bool {
-        self.gilrs.gamepads().count() > 0
+        match self.mode {
+            InputMode::Gamepad => self.gilrs.gamepads().count() > 0,
+            InputMode::Keyboard | InputMode::Test => true,
+        }
+    }
+
+    fn mode_name(&self) -> &str {
+        match self.mode {
+            InputMode::Gamepad => "gamepad",
+            InputMode::Keyboard => "keyboard",
+            InputMode::Test => "test",
+        }
+    }
+}
+
+impl Drop for InputState {
+    fn drop(&mut self) {
+        if self.mode == InputMode::Keyboard {
+            crossterm::terminal::disable_raw_mode().ok();
+        }
     }
 }
 
@@ -345,8 +542,8 @@ impl QuadrotorSil {
         let stepper = SimStepper::new(
             &result.dae,
             StepperOptions {
-                rtol: 1e-4,
-                atol: 1e-4,
+                rtol: 1e-3,
+                atol: 1e-3,
                 ..Default::default()
             },
         )?;
@@ -434,8 +631,8 @@ impl QuadrotorSil {
         self.stepper = SimStepper::new(
             &result.dae,
             StepperOptions {
-                rtol: 1e-4,
-                atol: 1e-4,
+                rtol: 1e-3,
+                atol: 1e-3,
                 ..Default::default()
             },
         )?;
@@ -446,11 +643,11 @@ impl QuadrotorSil {
         self.stepper.time()
     }
 
-    /// Build a SimInput from physics sensors + gamepad RC channels.
+    /// Build a SimInput from physics sensors + input RC channels.
     fn sensor_to_sim_input(
         &self,
         sensors: &SensorOutput,
-        gamepad: &GamepadState,
+        input: &InputState,
     ) -> cerebri_fb::SimInput {
         cerebri_fb::SimInput {
             gyro: [
@@ -463,9 +660,9 @@ impl QuadrotorSil {
                 sensors.accel[1] as f32,
                 sensors.accel[2] as f32,
             ],
-            rc: gamepad.rc,
-            rc_link_quality: if gamepad.is_connected() { 255 } else { 0 },
-            rc_valid: gamepad.is_connected(),
+            rc: input.rc,
+            rc_link_quality: if input.is_connected() { 255 } else { 0 },
+            rc_valid: input.is_connected(),
             imu_valid: true,
         }
     }
@@ -507,6 +704,15 @@ const HTML_PAGE: &str = r##"<!DOCTYPE html>
     font-size: 12px; line-height: 1.5; backdrop-filter: blur(4px);
     border: 1px solid rgba(200,160,80,0.2);
   }
+  #controls {
+    position: fixed; bottom: 10px; right: 10px; z-index: 10;
+    background: rgba(30,20,10,0.75); padding: 8px 14px; border-radius: 6px;
+    font-size: 11px; line-height: 1.6; backdrop-filter: blur(4px);
+    border: 1px solid rgba(200,160,80,0.2); max-width: 240px;
+  }
+  #controls b { color: #e8c840; }
+  #controls .key { color: #70b8e0; display: inline-block; min-width: 70px; }
+  #controls .action { color: #a89070; }
 </style>
 </head>
 <body>
@@ -530,6 +736,7 @@ const HTML_PAGE: &str = r##"<!DOCTYPE html>
   <b>Mode:</b> <span id="v-mode-text">Self-test (hover)</span>
 </div>
 <div id="status"><span class="disconnected" id="ws-status">Connecting...</span></div>
+<div id="controls"></div>
 
 <script>
 __THREE_JS__
@@ -894,6 +1101,46 @@ function connectWS() {
 }
 connectWS();
 
+const controlsMap = {
+  keyboard: [
+    ["<b>Keyboard Controls</b>"],
+    ["Up / Down", "Throttle"],
+    ["Left / Right", "Yaw"],
+    ["W / S", "Pitch fwd/back"],
+    ["A / D", "Roll left/right"],
+    ["Space", "Arm / Disarm"],
+    ["Q", "Quit"],
+  ],
+  gamepad: [
+    ["<b>Gamepad Controls</b>"],
+    ["Left Stick Y", "Throttle (ramp)"],
+    ["Left Stick X", "Yaw"],
+    ["Right Stick Y", "Pitch"],
+    ["Right Stick X", "Roll"],
+    ["Start", "Arm / Disarm"],
+  ],
+  test: [
+    ["<b>Test Sequence</b>"],
+    ["", "Scripted flight pattern"],
+    ["", "Arms, hovers, maneuvers"],
+    ["", "Loops every 30s"],
+  ],
+};
+
+let currentInputMode = "";
+function updateControls(mode) {
+  if (mode === currentInputMode) return;
+  currentInputMode = mode;
+  const entries = controlsMap[mode] || controlsMap["keyboard"];
+  const el = document.getElementById("controls");
+  el.innerHTML = entries.map((e, i) => {
+    if (i === 0) return e[0];
+    if (!e[0]) return '<span class="action">' + e[1] + '</span>';
+    return '<span class="key">' + e[0] + '</span> <span class="action">' + e[1] + '</span>';
+  }).join("<br>");
+}
+updateControls("keyboard");
+
 function animate() {
   requestAnimationFrame(animate);
   if (latestState) {
@@ -935,6 +1182,7 @@ function animate() {
     document.getElementById("v-gyro").textContent=`${(s.gyro_x||0).toFixed(2)}, ${(s.gyro_y||0).toFixed(2)}, ${(s.gyro_z||0).toFixed(2)}`;
     document.getElementById("v-mag").textContent=`${(s.mag_x||0).toFixed(3)}, ${(s.mag_y||0).toFixed(3)}, ${(s.mag_z||0).toFixed(3)}`;
     if (s.mode) document.getElementById("v-mode-text").textContent = s.mode;
+    if (s.input_mode) updateControls(s.input_mode);
   }
   camera.position.set(camTarget.x+camDist*Math.sin(camAngle)*Math.cos(camElev),camTarget.y+camDist*Math.sin(camElev),camTarget.z+camDist*Math.cos(camAngle)*Math.cos(camElev));
   camera.lookAt(camTarget); renderer.render(scene, camera);
@@ -979,6 +1227,7 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.004); // 250 Hz default
+    let test_mode = std::env::var("SIL_TEST").map_or(false, |v| v == "1" || v == "true");
 
     let udp_mode = !udp_listen.is_empty() && !udp_send.is_empty();
 
@@ -1052,25 +1301,23 @@ fn main() -> anyhow::Result<()> {
         eprintln!("Listening for motor_output on {udp_listen}");
         eprintln!("Sending SimInput to {udp_send}");
 
-        let mut gamepad = GamepadState::new();
+        let input_mode = if test_mode { InputMode::Test } else { InputMode::Gamepad };
+        let mut input = InputState::new(input_mode);
         let mut recv_buf = [0u8; 256];
         let mut armed;
         let mut pkt_count = 0u64;
+        let mut first_nonzero_motors = true;
 
         loop {
             let frame_start = Instant::now();
 
-            // Poll gamepad
-            gamepad.poll();
+            input.poll();
 
-            // Try to receive a motor_output packet
             match socket.recv_from(&mut recv_buf) {
                 Ok((n, _src)) => {
                     if let Some(motor_out) = cerebri_fb::unpack_motor_output(&recv_buf[..n]) {
                         armed = motor_out.armed;
 
-                        // Convert normalised motors [0..1] to rad/s
-                        // Zero when disarmed — drone sits on ground via contact model
                         let motor_rpms = [
                             (motor_out.motors[0] as f64 * OMEGA_MAX),
                             (motor_out.motors[1] as f64 * OMEGA_MAX),
@@ -1078,62 +1325,73 @@ fn main() -> anyhow::Result<()> {
                             (motor_out.motors[3] as f64 * OMEGA_MAX),
                         ];
 
+                        if first_nonzero_motors && motor_rpms.iter().any(|&m| m > 0.01) {
+                            eprintln!("\r[udp] FIRST NON-ZERO MOTORS: [{:.1},{:.1},{:.1},{:.1}] armed={} t={:.4}    ",
+                                motor_rpms[0], motor_rpms[1], motor_rpms[2], motor_rpms[3], armed, sil.time());
+                            first_nonzero_motors = false;
+                        }
+
                         let target_clock = sil.time() + dt;
                         match sil.receive_motors(motor_rpms, target_clock) {
                             Ok(sensors) => {
-                                // Pack and send SimInput (sensors + RC from gamepad)
-                                let sim_input = sil.sensor_to_sim_input(&sensors, &gamepad);
+                                let sim_input = sil.sensor_to_sim_input(&sensors, &input);
                                 let buf = cerebri_fb::pack_sim_input(&sim_input);
                                 let _ = socket.send_to(&buf, &udp_send);
 
                                 pkt_count += 1;
                                 if pkt_count % 250 == 0 {
+                                    let frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
                                     eprintln!(
-                                        "[udp] t={:.1}s alt={:.2}m motors=[{:.2},{:.2},{:.2},{:.2}] armed={} rc=[{},{},{},{}] gamepad={}",
+                                        "\r[udp] t={:.1}s alt={:.2}m motors=[{:.2},{:.2},{:.2},{:.2}] cerebri_armed={} rc=[{},{},{},{},arm={}] input={} frame={:.1}ms    ",
                                         sensors.clock_sec,
                                         -sensors.position_ned[2],
                                         motor_out.motors[0], motor_out.motors[1],
                                         motor_out.motors[2], motor_out.motors[3],
                                         armed,
-                                        gamepad.rc[0], gamepad.rc[1], gamepad.rc[2], gamepad.rc[3],
-                                        if gamepad.is_connected() { "connected" } else { "none" },
+                                        input.rc[0], input.rc[1], input.rc[2], input.rc[3],
+                                        input.rc[4],
+                                        input.mode_name(),
+                                        frame_ms,
                                     );
                                 }
                             }
-                            Err(e) => eprintln!("[udp] Step error: {e}"),
+                            Err(e) => eprintln!("\r[udp] Step error: {e}"),
                         }
 
-                        // Stream to viz
                         let mut json = sil.state_json();
-                        json.pop(); // remove trailing }
+                        json.pop();
                         json.push_str(&format!(
-                            r#","mode":"UDP ({})","armed":{},"rc_throttle":{},"gamepad":{}}}"#,
+                            r#","mode":"UDP ({}, {})","armed":{},"rc_throttle":{},"input_connected":{},"input_mode":"{}"}}"#,
                             if armed { "ARMED" } else { "disarmed" },
+                            input.mode_name(),
                             armed,
-                            gamepad.rc[2],
-                            gamepad.is_connected(),
+                            input.rc[2],
+                            input.is_connected(),
+                            input.mode_name(),
                         ));
                         let _ = state_tx.send(json);
                     } else if n > 0 {
-                        eprintln!("[udp] Invalid packet ({n} bytes), expected {}", cerebri_fb::MOTOR_OUTPUT_SIZE);
+                        eprintln!("\r[udp] Invalid packet ({n} bytes), expected {}", cerebri_fb::MOTOR_OUTPUT_SIZE);
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    // No motor packet yet — still send SimInput so Cerebri gets IMU+RC
                     let sensors = sil.read_sensors();
-                    let sim_input = sil.sensor_to_sim_input(&sensors, &gamepad);
+                    let sim_input = sil.sensor_to_sim_input(&sensors, &input);
                     let buf = cerebri_fb::pack_sim_input(&sim_input);
                     let _ = socket.send_to(&buf, &udp_send);
 
-                    // Still stream state to viewer
                     let mut json = sil.state_json();
                     json.pop();
-                    json.push_str(r#","mode":"UDP (waiting for Cerebri)"}"#);
+                    json.push_str(&format!(
+                        r#","mode":"UDP (waiting, {})","input_mode":"{}"}}"#,
+                        input.mode_name(),
+                        input.mode_name(),
+                    ));
                     let _ = state_tx.send(json);
                 }
-                Err(e) => eprintln!("[udp] recv error: {e}"),
+                Err(e) => eprintln!("\r[udp] recv error: {e}"),
             }
 
             let elapsed = frame_start.elapsed();
@@ -1145,12 +1403,13 @@ fn main() -> anyhow::Result<()> {
     } else {
         // ===== Self-test mode: sit on ground =====
         eprintln!("Running self-test: drone on ground (no motors)\n");
-        let mut gamepad = GamepadState::new();
+        let input_mode = if test_mode { InputMode::Test } else { InputMode::Gamepad };
+        let mut input = InputState::new(input_mode);
         let mut frame_count = 0u64;
 
         loop {
             let frame_start = Instant::now();
-            gamepad.poll();
+            input.poll();
 
             let motor_rpms = [0.0; 4];
             let target_clock = sil.time() + dt;
@@ -1159,20 +1418,25 @@ fn main() -> anyhow::Result<()> {
                     frame_count += 1;
                     if frame_count % 250 == 0 {
                         eprintln!(
-                            "[sil] t={:.1}s alt={:.3}m accel_z={:.2} gyro=[{:.3},{:.3},{:.3}]",
+                            "\r[sil] t={:.1}s alt={:.3}m accel_z={:.2} gyro=[{:.3},{:.3},{:.3}] input={}    ",
                             sensors.clock_sec,
                             -sensors.position_ned[2],
                             sensors.accel[2],
                             sensors.gyro[0], sensors.gyro[1], sensors.gyro[2],
+                            input.mode_name(),
                         );
                     }
                 }
-                Err(e) => eprintln!("[sil] Step error: {e}"),
+                Err(e) => eprintln!("\r[sil] Step error: {e}"),
             }
 
             let mut json = sil.state_json();
             json.pop();
-            json.push_str(r#","mode":"Self-test (ground)"}"#);
+            json.push_str(&format!(
+                r#","mode":"Self-test (ground, {})","input_mode":"{}"}}"#,
+                input.mode_name(),
+                input.mode_name(),
+            ));
             let _ = state_tx.send(json);
 
             let elapsed = frame_start.elapsed();

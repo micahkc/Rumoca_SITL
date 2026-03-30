@@ -29,6 +29,10 @@ model QuadrotorSIL
   // --- Ground contact (spring-damper) ---
   parameter Real ground_k = 1000 "Ground stiffness [N/m]";
   parameter Real ground_c = 100 "Ground damping [N*s/m]";
+  parameter Real ground_eps = 0.02 "Ground contact smoothing [m]";
+
+  // --- Quaternion normalization feedback gain ---
+  parameter Real qnorm_gain = 1.0 "Quaternion renormalization gain";
 
   // --- Motor inputs [rad/s] (start at zero on the ground) ---
   input Real omega_m1(start = 0) "Motor 1 (FR, CW)";
@@ -100,8 +104,8 @@ equation
   R33 = 1 - 2*(q1*q1 + q2*q2);
 
   // --- Ground contact (NED: pz > 0 means below ground) ---
-  // Smooth spring-damper using max() to avoid hard events
-  F_ground = -ground_k * max(pz, 0) - ground_c * vz * max(pz, 0) / (max(pz, 0) + 0.001);
+  F_ground = -ground_k * (pz + sqrt(pz*pz + ground_eps*ground_eps)) / 2
+             - ground_c * vz * (1 + pz / sqrt(pz*pz + ground_eps*ground_eps)) / 2;
 
   // --- Translational dynamics (NED: gravity along +z) ---
   der(px) = vx;
@@ -112,11 +116,13 @@ equation
   der(vy) = R23 * a_bz;
   der(vz) = R33 * a_bz + g + F_ground / mass;
 
-  // --- Quaternion kinematics ---
-  der(q0) = 0.5 * (-q1*omega_x - q2*omega_y - q3*omega_z);
-  der(q1) = 0.5 * ( q0*omega_x - q3*omega_y + q2*omega_z);
-  der(q2) = 0.5 * ( q3*omega_x + q0*omega_y - q1*omega_z);
-  der(q3) = 0.5 * (-q2*omega_x + q1*omega_y + q0*omega_z);
+  // --- Quaternion kinematics (with Baumgarte stabilization) ---
+  // The correction term -lambda*(|q|^2-1)*q drives the quaternion
+  // back toward unit norm, preventing drift that crashes the solver.
+  der(q0) = 0.5 * (-q1*omega_x - q2*omega_y - q3*omega_z) - qnorm_gain * (q0*q0+q1*q1+q2*q2+q3*q3-1)*q0;
+  der(q1) = 0.5 * ( q0*omega_x - q3*omega_y + q2*omega_z) - qnorm_gain * (q0*q0+q1*q1+q2*q2+q3*q3-1)*q1;
+  der(q2) = 0.5 * ( q3*omega_x + q0*omega_y - q1*omega_z) - qnorm_gain * (q0*q0+q1*q1+q2*q2+q3*q3-1)*q2;
+  der(q3) = 0.5 * (-q2*omega_x + q1*omega_y + q0*omega_z) - qnorm_gain * (q0*q0+q1*q1+q2*q2+q3*q3-1)*q3;
 
   // --- Angular dynamics (Euler's equations) ---
   der(omega_x) = (Mx + (Iyy - Izz) * omega_y * omega_z) / Ixx;
