@@ -1,21 +1,25 @@
 //! Quadrotor SIL (Software-in-the-Loop) plant simulator.
 //!
-//! Receives motor commands from Cerebri via UDP (48-byte flatbuffer),
-//! steps 6-DOF quadrotor physics, sends back sensor data as a
-//! 164-byte flight_snapshot flatbuffer, and streams visualization
-//! to a Three.js browser viewer.
+//! Receives motor commands via UDP flatbuffer, steps 6-DOF quadrotor
+//! physics, sends back sensor data, and streams visualization to a
+//! Three.js browser viewer.
+//!
+//! The flatbuffer protocol is driven by a TOML config + .bfbs schema
+//! reflection — no hand-coded pack/unpack. See `sil_config.toml`.
 //!
 //! Usage:
-//!   cargo run
-//!   Then open http://localhost:8080 in a browser.
-//!
-//! UDP ports (configurable via env vars):
-//!   SIL_UDP_LISTEN=0.0.0.0:4243   — listen for motor_output from Cerebri
-//!   SIL_UDP_SEND=192.0.2.1:4242   — send flight_snapshot to Cerebri
-//!   SIL_DT=0.004                   — simulation timestep in seconds
+//!   cargo run                        # uses ./sil_config.toml
+//!   cargo run -- path/to/config.toml # custom config
 
+mod bfbs;
+mod codec;
+mod config;
+
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, UdpSocket};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,6 +28,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use gilrs::{Axis, Button, Gilrs};
 use rumoca_sim::{SimStepper, StepperOptions};
 use tungstenite::{accept, Message};
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 const HTTP_PORT: u16 = 8080;
 const WS_PORT: u16 = 8081;
@@ -37,188 +43,10 @@ const MASS: f64 = 2.0;
 const G: f64 = 9.80665;
 const CT: f64 = 8.5e-6;
 
-/// Max motor angular velocity [rad/s] for normalised→rad/s conversion.
-/// motors[i] in [0,1] maps to [0, OMEGA_MAX].
-const OMEGA_MAX: f64 = 1100.0;
-
 fn hover_omega() -> f64 {
     (MASS * G / (4.0 * CT)).sqrt()
 }
 
-// ===========================================================================
-// Cerebri flatbuffer protocol (Rust port of topic_flatbuffer.c)
-// ===========================================================================
-
-mod cerebri_fb {
-    // --- Motor output (Cerebri → SIL): 48 bytes ---
-    pub(super) const MOTOR_OUTPUT_SIZE: usize = 48;
-    const MOTOR_VTABLE_OFFSET: usize = 4;
-    const MOTOR_VTABLE_SIZE: u16 = 12;
-    const MOTOR_TABLE_OFFSET: usize = MOTOR_VTABLE_OFFSET + MOTOR_VTABLE_SIZE as usize; // 16
-    const MOTOR_OBJECT_SIZE: u16 = 32;
-    const MOTOR_FIELD_MOTORS: u16 = 4;
-    const MOTOR_FIELD_RAW: u16 = 20;
-    const MOTOR_FIELD_ARMED: u16 = 28;
-    const MOTOR_FIELD_TEST_MODE: u16 = 29;
-
-    // --- SimInput (SIL → Cerebri): 120 bytes, identifier "C2SI" ---
-    pub(super) const SIM_INPUT_SIZE: usize = 120;
-    const SIM_INPUT_FILE_ID: &[u8; 4] = b"C2SI";
-    const SIM_INPUT_VTABLE_OFFSET: usize = 8; // after root(4) + file_id(4)
-    const SIM_INPUT_VTABLE_SIZE: u16 = 16;    // 4 header + 6 fields * 2
-    const SIM_INPUT_TABLE_OFFSET: usize = SIM_INPUT_VTABLE_OFFSET + SIM_INPUT_VTABLE_SIZE as usize; // 24
-    const SIM_INPUT_OBJECT_SIZE: u16 = 96;
-    const SIM_INPUT_FIELD_GYRO: u16 = 4;
-    const SIM_INPUT_FIELD_ACCEL: u16 = 16;
-    const SIM_INPUT_FIELD_RC: u16 = 28;
-    const SIM_INPUT_FIELD_RC_LINK_QUALITY: u16 = 92;
-    const SIM_INPUT_FIELD_RC_VALID: u16 = 93;
-    const SIM_INPUT_FIELD_IMU_VALID: u16 = 94;
-
-    // --- Data structs ---
-
-    #[derive(Debug, Clone, Default)]
-    pub(super) struct MotorOutput {
-        pub motors: [f32; 4],   // normalised 0..1
-        pub raw: [u16; 4],      // PWM microseconds
-        pub armed: bool,
-        pub test_mode: bool,
-    }
-
-    #[derive(Debug, Clone)]
-    pub(super) struct SimInput {
-        pub gyro: [f32; 3],
-        pub accel: [f32; 3],
-        pub rc: [i32; 16],
-        pub rc_link_quality: u8,
-        pub rc_valid: bool,
-        pub imu_valid: bool,
-    }
-
-    // --- Little-endian helpers ---
-
-    fn get_le16(buf: &[u8]) -> u16 {
-        u16::from_le_bytes([buf[0], buf[1]])
-    }
-    fn get_le32(buf: &[u8]) -> u32 {
-        u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
-    }
-    fn get_float_le(buf: &[u8]) -> f32 {
-        f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
-    }
-
-    fn put_le16(buf: &mut [u8], v: u16) {
-        buf[..2].copy_from_slice(&v.to_le_bytes());
-    }
-    fn put_le32(buf: &mut [u8], v: u32) {
-        buf[..4].copy_from_slice(&v.to_le_bytes());
-    }
-    #[allow(dead_code)]
-    fn put_le64(buf: &mut [u8], v: u64) {
-        buf[..8].copy_from_slice(&v.to_le_bytes());
-    }
-    fn put_float_le(buf: &mut [u8], v: f32) {
-        buf[..4].copy_from_slice(&v.to_le_bytes());
-    }
-
-    // --- Unpack motor_output (48 bytes → MotorOutput) ---
-
-    pub(super) fn unpack_motor_output(buf: &[u8]) -> Option<MotorOutput> {
-        if buf.len() != MOTOR_OUTPUT_SIZE {
-            return None;
-        }
-        // Validate layout
-        let root_offset = get_le32(&buf[0..4]);
-        if root_offset != MOTOR_TABLE_OFFSET as u32 {
-            return None;
-        }
-        let table = MOTOR_TABLE_OFFSET;
-        let vtable_distance = get_le32(&buf[table..table + 4]);
-        if vtable_distance != (MOTOR_TABLE_OFFSET - MOTOR_VTABLE_OFFSET) as u32 {
-            return None;
-        }
-        let vt = MOTOR_VTABLE_OFFSET;
-        if get_le16(&buf[vt..]) != MOTOR_VTABLE_SIZE
-            || get_le16(&buf[vt + 2..]) != MOTOR_OBJECT_SIZE
-            || get_le16(&buf[vt + 4..]) != MOTOR_FIELD_MOTORS
-            || get_le16(&buf[vt + 6..]) != MOTOR_FIELD_RAW
-            || get_le16(&buf[vt + 8..]) != MOTOR_FIELD_ARMED
-            || get_le16(&buf[vt + 10..]) != MOTOR_FIELD_TEST_MODE
-        {
-            return None;
-        }
-
-        let mut out = MotorOutput::default();
-        let m = table + MOTOR_FIELD_MOTORS as usize;
-        for i in 0..4 {
-            out.motors[i] = get_float_le(&buf[m + i * 4..]);
-        }
-        let r = table + MOTOR_FIELD_RAW as usize;
-        for i in 0..4 {
-            out.raw[i] = get_le16(&buf[r + i * 2..]);
-        }
-        out.armed = buf[table + MOTOR_FIELD_ARMED as usize] != 0;
-        out.test_mode = buf[table + MOTOR_FIELD_TEST_MODE as usize] != 0;
-        Some(out)
-    }
-
-    // --- Pack SimInput (SimInput → 120 bytes) ---
-
-    pub(super) fn pack_sim_input(input: &SimInput) -> [u8; SIM_INPUT_SIZE] {
-        let mut buf = [0u8; SIM_INPUT_SIZE];
-
-        // Root offset → points to table
-        put_le32(&mut buf[0..4], SIM_INPUT_TABLE_OFFSET as u32);
-
-        // File identifier "C2SI" at bytes 4-7
-        buf[4..8].copy_from_slice(SIM_INPUT_FILE_ID);
-
-        // Vtable at offset 8
-        let vt = SIM_INPUT_VTABLE_OFFSET;
-        put_le16(&mut buf[vt..], SIM_INPUT_VTABLE_SIZE);
-        put_le16(&mut buf[vt + 2..], SIM_INPUT_OBJECT_SIZE);
-        put_le16(&mut buf[vt + 4..], SIM_INPUT_FIELD_GYRO);
-        put_le16(&mut buf[vt + 6..], SIM_INPUT_FIELD_ACCEL);
-        put_le16(&mut buf[vt + 8..], SIM_INPUT_FIELD_RC);
-        put_le16(&mut buf[vt + 10..], SIM_INPUT_FIELD_RC_LINK_QUALITY);
-        put_le16(&mut buf[vt + 12..], SIM_INPUT_FIELD_RC_VALID);
-        put_le16(&mut buf[vt + 14..], SIM_INPUT_FIELD_IMU_VALID);
-
-        // Table at offset 24
-        let t = SIM_INPUT_TABLE_OFFSET;
-        // soffset back to vtable (signed: table_offset - vtable_offset)
-        put_le32(
-            &mut buf[t..t + 4],
-            (SIM_INPUT_TABLE_OFFSET - SIM_INPUT_VTABLE_OFFSET) as u32,
-        );
-
-        // Gyro (3 x f32)
-        let g = t + SIM_INPUT_FIELD_GYRO as usize;
-        for i in 0..3 {
-            put_float_le(&mut buf[g + i * 4..], input.gyro[i]);
-        }
-
-        // Accel (3 x f32)
-        let a = t + SIM_INPUT_FIELD_ACCEL as usize;
-        for i in 0..3 {
-            put_float_le(&mut buf[a + i * 4..], input.accel[i]);
-        }
-
-        // RC channels (16 x i32)
-        let rc = t + SIM_INPUT_FIELD_RC as usize;
-        for i in 0..16 {
-            put_le32(&mut buf[rc + i * 4..], input.rc[i] as u32);
-        }
-
-        // Scalar fields
-        buf[t + SIM_INPUT_FIELD_RC_LINK_QUALITY as usize] = input.rc_link_quality;
-        buf[t + SIM_INPUT_FIELD_RC_VALID as usize] = input.rc_valid as u8;
-        buf[t + SIM_INPUT_FIELD_IMU_VALID as usize] = input.imu_valid as u8;
-
-        buf
-    }
-
-}
 
 // ===========================================================================
 // Input → RC channels (gamepad, keyboard, or test sequence)
@@ -351,6 +179,19 @@ impl InputState {
         let Some((_id, gamepad)) = self.gilrs.gamepads().next() else {
             return;
         };
+
+        // Debug: print raw axis values once per second
+        if self.last_poll.elapsed() > Duration::from_secs(1) {
+            eprintln!(
+                "\r[gp] LX={:.2} LY={:.2} RX={:.2} RY={:.2} armed={} throttle={:.2}    ",
+                gamepad.value(Axis::LeftStickX),
+                gamepad.value(Axis::LeftStickY),
+                gamepad.value(Axis::RightStickX),
+                gamepad.value(Axis::RightStickY),
+                self.armed,
+                self.throttle,
+            );
+        }
 
         self.rc[0] = axis_to_rc(gamepad.value(Axis::RightStickX), RC_CENTER, 500);
         self.rc[1] = axis_to_rc(gamepad.value(Axis::RightStickY), RC_CENTER, -500);
@@ -643,29 +484,6 @@ impl QuadrotorSil {
         self.stepper.time()
     }
 
-    /// Build a SimInput from physics sensors + input RC channels.
-    fn sensor_to_sim_input(
-        &self,
-        sensors: &SensorOutput,
-        input: &InputState,
-    ) -> cerebri_fb::SimInput {
-        cerebri_fb::SimInput {
-            gyro: [
-                sensors.gyro[0] as f32,
-                sensors.gyro[1] as f32,
-                sensors.gyro[2] as f32,
-            ],
-            accel: [
-                sensors.accel[0] as f32,
-                sensors.accel[1] as f32,
-                sensors.accel[2] as f32,
-            ],
-            rc: input.rc,
-            rc_link_quality: if input.is_connected() { 255 } else { 0 },
-            rc_valid: input.is_connected(),
-            imu_valid: true,
-        }
-    }
 }
 
 // ===========================================================================
@@ -808,6 +626,31 @@ floor.rotation.x = -Math.PI / 2; floor.position.y = -0.01; scene.add(floor);
 const grid = new THREE.GridHelper(50, 50, 0xc49850, 0xc49850);
 grid.material.transparent = true; grid.material.opacity = 0.12;
 scene.add(grid);
+
+// ═══ "CogniPilot" IN THE SAND ═══
+{
+  const canvas = document.createElement("canvas");
+  canvas.width = 1024; canvas.height = 128;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "rgba(0,0,0,0)";
+  ctx.fillRect(0, 0, 1024, 128);
+  ctx.font = "bold 90px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#b8944a";
+  ctx.fillText("CogniPilot", 512, 64);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.anisotropy = 4;
+  const mat = new THREE.MeshStandardMaterial({
+    map: tex, transparent: true, alphaTest: 0.1,
+    roughness: 0.95, metalness: 0.0,
+    depthWrite: false,
+  });
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(8, 1), mat);
+  plane.rotation.x = -Math.PI / 2;
+  plane.position.set(0, 0.002, 4);
+  scene.add(plane);
+}
 
 // ═══ SAND DUNES ═══
 const duneMat = new THREE.MeshStandardMaterial({ color: 0xd9b06a, roughness: 0.9 });
@@ -1096,8 +939,9 @@ let ws = null, latestState = null;
 function connectWS() {
   ws = new WebSocket("ws://localhost:__WS_PORT__");
   ws.onopen = () => { document.getElementById("ws-status").textContent = "Connected"; document.getElementById("ws-status").className = "connected"; };
-  ws.onclose = () => { document.getElementById("ws-status").textContent = "Disconnected"; document.getElementById("ws-status").className = "disconnected"; setTimeout(connectWS, 1000); };
-  ws.onmessage = (e) => { latestState = JSON.parse(e.data); };
+  ws.onclose = () => { document.getElementById("ws-status").textContent = "Disconnected"; document.getElementById("ws-status").className = "disconnected"; setTimeout(connectWS, 2000); };
+  ws.onerror = () => { ws.close(); };
+  ws.onmessage = (e) => { try { latestState = JSON.parse(e.data); } catch(err) {} };
 }
 connectWS();
 
@@ -1219,18 +1063,77 @@ fn serve_http(listener: TcpListener, html: String) {
 // Main
 // ===========================================================================
 
+fn ctrlc_handler() {
+    unsafe {
+        libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handle_sigint as libc::sighandler_t);
+    }
+}
+
+extern "C" fn handle_sigint(_: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+    crossterm::terminal::disable_raw_mode().ok();
+    std::process::exit(0);
+}
+
+/// Build the values HashMap for the pack (send) codec from sensor outputs
+/// and input state. Variable names match the TOML routing config.
+fn build_send_values(sensors: &SensorOutput, input: &InputState) -> HashMap<String, f64> {
+    let mut v = HashMap::with_capacity(24);
+
+    // IMU sensors
+    v.insert("gyro_x".into(), sensors.gyro[0]);
+    v.insert("gyro_y".into(), sensors.gyro[1]);
+    v.insert("gyro_z".into(), sensors.gyro[2]);
+    v.insert("accel_x".into(), sensors.accel[0]);
+    v.insert("accel_y".into(), sensors.accel[1]);
+    v.insert("accel_z".into(), sensors.accel[2]);
+
+    // RC channels
+    for i in 0..16 {
+        v.insert(format!("rc_{i}"), input.rc[i] as f64);
+    }
+
+    // Link status
+    let connected = input.is_connected();
+    v.insert("rc_link_quality".into(), if connected { 255.0 } else { 0.0 });
+    v.insert("rc_valid".into(), if connected { 1.0 } else { 0.0 });
+    v.insert("imu_valid".into(), 1.0);
+
+    v
+}
+
 fn main() -> anyhow::Result<()> {
-    // Configuration from environment
-    let udp_listen = std::env::var("SIL_UDP_LISTEN").unwrap_or_default();
-    let udp_send = std::env::var("SIL_UDP_SEND").unwrap_or_default();
-    let dt: f64 = std::env::var("SIL_DT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.004); // 250 Hz default
-    let test_mode = std::env::var("SIL_TEST").map_or(false, |v| v == "1" || v == "true");
+    ctrlc_handler();
 
-    let udp_mode = !udp_listen.is_empty() && !udp_send.is_empty();
+    // Load TOML config
+    let config_path = std::env::args().nth(1).unwrap_or_else(|| "sil_config.toml".into());
+    let cfg = config::SilConfig::load(Path::new(&config_path))?;
+    eprintln!("Loaded config from {config_path}");
 
+    let dt = cfg.sim.dt;
+    let realtime = cfg.sim.realtime;
+    let test_mode = cfg.sim.test;
+
+    // Load .bfbs schemas and compile codecs
+    let mut schema = bfbs::SchemaSet::new();
+    for bfbs_path in &cfg.schema.bfbs {
+        eprintln!("Loading schema: {bfbs_path}");
+        schema.load_bfbs(Path::new(bfbs_path))?;
+    }
+    let unpack_codec = codec::UnpackCodec::compile(&schema, &cfg.receive)?;
+    let pack_codec = codec::PackCodec::compile(&schema, &cfg.send)?;
+    eprintln!(
+        "Codecs compiled: receive {} ({} bytes, {} fields), send {} ({} bytes, {} fields)",
+        cfg.receive.root_type,
+        unpack_codec.expected_size(),
+        cfg.receive.route.len(),
+        cfg.send.root_type,
+        pack_codec.size(),
+        cfg.send.route.len(),
+    );
+
+    // Compile physics model
     eprintln!("Compiling QuadrotorSIL model...");
     let mut sil = QuadrotorSil::new()?;
     eprintln!("Inputs: {:?}", sil.stepper.input_names());
@@ -1242,11 +1145,12 @@ fn main() -> anyhow::Result<()> {
         omega_hover * 60.0 / (2.0 * std::f64::consts::PI)
     );
 
+    let udp_mode = cfg.udp.is_some();
     if udp_mode {
-        eprintln!("UDP mode: listen={} send={} dt={}s", udp_listen, udp_send, dt);
+        let udp = cfg.udp.as_ref().unwrap();
+        eprintln!("UDP mode: listen={} send={} dt={}s realtime={}", udp.listen, udp.send, dt, realtime);
     } else {
-        eprintln!("Self-test mode (no UDP). Set SIL_UDP_LISTEN and SIL_UDP_SEND to enable.");
-        eprintln!("  Example: SIL_UDP_LISTEN=0.0.0.0:4243 SIL_UDP_SEND=192.0.2.1:4242");
+        eprintln!("Self-test mode (no [udp] in config).");
     }
 
     // Prepare HTML
@@ -1273,135 +1177,138 @@ fn main() -> anyhow::Result<()> {
                 Err(e) => { eprintln!("WS error: {e}"); continue; }
             };
             ws.get_ref().set_nonblocking(true).ok();
-            loop {
+            ws.get_ref().set_write_timeout(Some(Duration::from_millis(100))).ok();
+            let mut alive = true;
+            while alive {
                 loop {
                     match ws.read() {
-                        Ok(Message::Close(_)) => break,
+                        Ok(Message::Close(_)) => { alive = false; break; }
                         Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
+                        Err(_) => { alive = false; break; }
                         _ => {}
                     }
                 }
+                if !alive { break; }
                 if let Ok(json) = state_rx.try_recv() {
                     let mut latest = json;
                     while let Ok(newer) = state_rx.try_recv() { latest = newer; }
-                    ws.get_ref().set_nonblocking(false).ok();
                     if ws.send(Message::Text(latest.into())).is_err() { break; }
-                    ws.get_ref().set_nonblocking(true).ok();
                 }
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(Duration::from_millis(16));
             }
         }
     });
 
-    if udp_mode {
-        // ===== UDP mode: receive motor_output, step, send flight_snapshot =====
-        let socket = UdpSocket::bind(&udp_listen)?;
+    if let Some(ref udp_cfg) = cfg.udp {
+        // ===== UDP mode: receive motor commands, step physics, send sensor data =====
+        let socket = UdpSocket::bind(&udp_cfg.listen)?;
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-        eprintln!("Listening for motor_output on {udp_listen}");
-        eprintln!("Sending SimInput to {udp_send}");
+        eprintln!("Listening on {}", udp_cfg.listen);
+        eprintln!("Sending to {}", udp_cfg.send);
 
         let input_mode = if test_mode { InputMode::Test } else { InputMode::Gamepad };
         let mut input = InputState::new(input_mode);
-        let mut recv_buf = [0u8; 256];
-        let mut armed;
+        let mut recv_buf = [0u8; 512];
+        let mut armed = false;
         let mut pkt_count = 0u64;
         let mut first_nonzero_motors = true;
 
+        let recv_expected = unpack_codec.expected_size();
+        eprintln!("Expecting {recv_expected}-byte receive packets on {}", udp_cfg.listen);
+
         loop {
             let frame_start = Instant::now();
-
             input.poll();
 
-            match socket.recv_from(&mut recv_buf) {
-                Ok((n, _src)) => {
-                    if let Some(motor_out) = cerebri_fb::unpack_motor_output(&recv_buf[..n]) {
-                        armed = motor_out.armed;
+            // Drain all queued packets, keeping only the latest valid one.
+            // Use non-blocking mode so we don't stall when packets arrive
+            // faster than the timeout.
+            let mut motor_rpms = [0.0f64; 4];
+            let mut got_motors = false;
 
-                        let motor_rpms = [
-                            (motor_out.motors[0] as f64 * OMEGA_MAX),
-                            (motor_out.motors[1] as f64 * OMEGA_MAX),
-                            (motor_out.motors[2] as f64 * OMEGA_MAX),
-                            (motor_out.motors[3] as f64 * OMEGA_MAX),
-                        ];
-
-                        if first_nonzero_motors && motor_rpms.iter().any(|&m| m > 0.01) {
-                            eprintln!("\r[udp] FIRST NON-ZERO MOTORS: [{:.1},{:.1},{:.1},{:.1}] armed={} t={:.4}    ",
-                                motor_rpms[0], motor_rpms[1], motor_rpms[2], motor_rpms[3], armed, sil.time());
-                            first_nonzero_motors = false;
-                        }
-
-                        let target_clock = sil.time() + dt;
-                        match sil.receive_motors(motor_rpms, target_clock) {
-                            Ok(sensors) => {
-                                let sim_input = sil.sensor_to_sim_input(&sensors, &input);
-                                let buf = cerebri_fb::pack_sim_input(&sim_input);
-                                let _ = socket.send_to(&buf, &udp_send);
-
-                                pkt_count += 1;
-                                if pkt_count % 250 == 0 {
-                                    let frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
-                                    eprintln!(
-                                        "\r[udp] t={:.1}s alt={:.2}m motors=[{:.2},{:.2},{:.2},{:.2}] cerebri_armed={} rc=[{},{},{},{},arm={}] input={} frame={:.1}ms    ",
-                                        sensors.clock_sec,
-                                        -sensors.position_ned[2],
-                                        motor_out.motors[0], motor_out.motors[1],
-                                        motor_out.motors[2], motor_out.motors[3],
-                                        armed,
-                                        input.rc[0], input.rc[1], input.rc[2], input.rc[3],
-                                        input.rc[4],
-                                        input.mode_name(),
-                                        frame_ms,
-                                    );
-                                }
+            socket.set_nonblocking(true).ok();
+            loop {
+                match socket.recv_from(&mut recv_buf) {
+                    Ok((n, _src)) => {
+                        pkt_count += 1;
+                        if n == recv_expected {
+                            let values = unpack_codec.unpack(&recv_buf[..n]);
+                            if !values.is_empty() {
+                                motor_rpms = [
+                                    values.get("omega_m1").copied().unwrap_or(0.0),
+                                    values.get("omega_m2").copied().unwrap_or(0.0),
+                                    values.get("omega_m3").copied().unwrap_or(0.0),
+                                    values.get("omega_m4").copied().unwrap_or(0.0),
+                                ];
+                                armed = values.get("armed").copied().unwrap_or(0.0) != 0.0;
+                                got_motors = true;
                             }
-                            Err(e) => eprintln!("\r[udp] Step error: {e}"),
                         }
-
-                        let mut json = sil.state_json();
-                        json.pop();
-                        json.push_str(&format!(
-                            r#","mode":"UDP ({}, {})","armed":{},"rc_throttle":{},"input_connected":{},"input_mode":"{}"}}"#,
-                            if armed { "ARMED" } else { "disarmed" },
-                            input.mode_name(),
-                            armed,
-                            input.rc[2],
-                            input.is_connected(),
-                            input.mode_name(),
-                        ));
-                        let _ = state_tx.send(json);
-                    } else if n > 0 {
-                        eprintln!("\r[udp] Invalid packet ({n} bytes), expected {}", cerebri_fb::MOTOR_OUTPUT_SIZE);
                     }
+                    Err(_) => break, // WouldBlock — queue drained
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    let sensors = sil.read_sensors();
-                    let sim_input = sil.sensor_to_sim_input(&sensors, &input);
-                    let buf = cerebri_fb::pack_sim_input(&sim_input);
-                    let _ = socket.send_to(&buf, &udp_send);
+            }
+            socket.set_nonblocking(false).ok();
+            socket.set_read_timeout(Some(Duration::from_millis(100))).ok();
 
-                    let mut json = sil.state_json();
-                    json.pop();
-                    json.push_str(&format!(
-                        r#","mode":"UDP (waiting, {})","input_mode":"{}"}}"#,
-                        input.mode_name(),
-                        input.mode_name(),
-                    ));
-                    let _ = state_tx.send(json);
+            // Step physics if we got motor commands
+            if got_motors {
+                if first_nonzero_motors && motor_rpms.iter().any(|&m| m > 0.01) {
+                    eprintln!("\r[udp] FIRST NON-ZERO MOTORS: [{:.1},{:.1},{:.1},{:.1}] armed={} t={:.4}    ",
+                        motor_rpms[0], motor_rpms[1], motor_rpms[2], motor_rpms[3], armed, sil.time());
+                    first_nonzero_motors = false;
                 }
-                Err(e) => eprintln!("\r[udp] recv error: {e}"),
+
+                let target_clock = sil.time() + dt;
+                if let Err(e) = sil.receive_motors(motor_rpms, target_clock) {
+                    eprintln!("\r[udp] Step error: {e}");
+                }
+                pkt_count += 1;
             }
 
-            let elapsed = frame_start.elapsed();
-            let target = Duration::from_secs_f64(dt);
-            if elapsed < target {
-                thread::sleep(target - elapsed);
+            // Always send sensor data so cerebri doesn't starve
+            let sensors = sil.read_sensors();
+            let send_vals = build_send_values(&sensors, &input);
+            let buf = pack_codec.pack(&send_vals);
+            let _ = socket.send_to(&buf, &udp_cfg.send);
+
+            // Status logging
+            if pkt_count % 250 == 0 && pkt_count > 0 && got_motors {
+                eprintln!(
+                    "\r[udp] t={:.1}s alt={:.2}m motors=[{:.0},{:.0},{:.0},{:.0}] armed={} rc=[{},{},{},{},arm={}] input={}    ",
+                    sensors.clock_sec,
+                    -sensors.position_ned[2],
+                    motor_rpms[0], motor_rpms[1], motor_rpms[2], motor_rpms[3],
+                    armed,
+                    input.rc[0], input.rc[1], input.rc[2], input.rc[3], input.rc[4],
+                    input.mode_name(),
+                );
+            }
+
+            // Viz update
+            let mode_str = if got_motors {
+                format!("UDP ({}, {})", if armed { "ARMED" } else { "disarmed" }, input.mode_name())
+            } else {
+                format!("UDP (waiting, {})", input.mode_name())
+            };
+            let mut json = sil.state_json();
+            json.pop();
+            json.push_str(&format!(
+                r#","mode":"{}","armed":{},"rc_throttle":{},"input_connected":{},"input_mode":"{}"}}"#,
+                mode_str, armed, input.rc[2], input.is_connected(), input.mode_name(),
+            ));
+            let _ = state_tx.send(json);
+
+            if realtime {
+                let elapsed = frame_start.elapsed();
+                let target = Duration::from_secs_f64(dt);
+                if elapsed < target {
+                    thread::sleep(target - elapsed);
+                }
             }
         }
     } else {
-        // ===== Self-test mode: sit on ground =====
+        // ===== Self-test mode: no UDP =====
         eprintln!("Running self-test: drone on ground (no motors)\n");
         let input_mode = if test_mode { InputMode::Test } else { InputMode::Gamepad };
         let mut input = InputState::new(input_mode);
@@ -1439,10 +1346,12 @@ fn main() -> anyhow::Result<()> {
             ));
             let _ = state_tx.send(json);
 
-            let elapsed = frame_start.elapsed();
-            let target = Duration::from_secs_f64(dt);
-            if elapsed < target {
-                thread::sleep(target - elapsed);
+            if realtime {
+                let elapsed = frame_start.elapsed();
+                let target = Duration::from_secs_f64(dt);
+                if elapsed < target {
+                    thread::sleep(target - elapsed);
+                }
             }
         }
     }

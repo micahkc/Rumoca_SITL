@@ -2787,9 +2787,12 @@ dependencies = [
  "anyhow",
  "crossterm",
  "gilrs",
+ "libc",
  "rumoca",
  "rumoca-sim",
+ "serde",
  "serde_json",
+ "toml",
  "tungstenite",
 ]
 

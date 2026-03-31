@@ -1,33 +1,56 @@
 # Quadrotor SIL Plant Simulator
 
-Software-in-the-loop plant model for a quadrotor. Communicates with Cerebri
-flight controller via UDP using the cerebri flatbuffer protocol (48-byte
-motor_output, 164-byte flight_snapshot).
+Software-in-the-loop plant model for a quadrotor. Communicates with any
+flatbuffer-based flight controller via UDP. The protocol is driven by a
+TOML config file + `.bfbs` (binary flatbuffer schema) reflection — no
+hand-coded pack/unpack. Swap the config and schema to work with a
+different controller.
 
 ## Quick Start
 
 ```bash
-# Self-test mode (hover, no UDP)
-cargo run --example quadrotor_sil -p rumoca
+# Edit sil_config.toml to set .bfbs paths and UDP addresses, then:
+cargo run
 
-# UDP mode (connected to Cerebri)
-SIL_UDP_LISTEN=0.0.0.0:4243 SIL_UDP_SEND=192.0.2.1:4242 \
-  cargo run --example quadrotor_sil -p rumoca
+# Or specify a custom config:
+cargo run -- path/to/my_config.toml
 ```
 
 Open http://localhost:8080 for the Three.js visualization.
 
-## Environment Variables
+## Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SIL_UDP_LISTEN` | (none) | UDP address to listen for motor_output packets |
-| `SIL_UDP_SEND` | (none) | UDP address to send flight_snapshot packets |
-| `SIL_DT` | `0.004` | Simulation timestep in seconds (250 Hz) |
-| `SIL_TEST` | (none) | Set to `1` for scripted test flight (arm, hover, maneuver, land, repeat) |
+All settings live in `sil_config.toml` (or a custom path passed as arg):
 
-Both `SIL_UDP_LISTEN` and `SIL_UDP_SEND` must be set to enable UDP mode.
-Without them, the simulator runs in self-test mode (constant hover RPMs).
+```toml
+[sim]
+dt = 0.004        # timestep [s]
+realtime = true    # wall-clock pacing
+test = false       # scripted test flight
+
+[udp]              # omit this section for self-test mode (no UDP)
+listen = "0.0.0.0:4243"
+send = "127.0.0.1:4242"
+
+[schema]
+bfbs = ["path/to/cerebri2_topics.bfbs", "path/to/cerebri2_sil.bfbs"]
+
+[receive]
+root_type = "cerebri2.topic.MotorOutput"
+
+[receive.route]
+"motors.m0" = { var = "omega_m1", scale = 1100.0 }
+# ...
+
+[send]
+root_type = "cerebri2.sil.SimInput"
+
+[send.route]
+"gyro.x" = { var = "gyro_x" }
+# ...
+```
+
+See `sil_config.toml` for the full cerebri2 configuration.
 
 ## Protocol
 
