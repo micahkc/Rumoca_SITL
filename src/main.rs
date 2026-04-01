@@ -73,6 +73,8 @@ struct InputState {
     kb_throttle_input: f64,
     // Test sequence state
     test_start: Instant,
+    // Reset request (gamepad A / keyboard R)
+    reset_requested: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -162,6 +164,7 @@ impl InputState {
             kb_yaw: 0.0,
             kb_throttle_input: 0.0,
             test_start: Instant::now(),
+            reset_requested: false,
         }
     }
 
@@ -218,6 +221,11 @@ impl InputState {
         }
         self.arm_prev = arm_btn;
         self.rc[4] = if self.armed { RC_MAX } else { RC_MIN };
+
+        // Reset: A button (South)
+        if gamepad.is_pressed(Button::South) {
+            self.reset_requested = true;
+        }
     }
 
     fn poll_keyboard(&mut self) {
@@ -269,6 +277,7 @@ impl InputState {
                                 );
                             }
                         }
+                        KeyCode::Char('r') => self.reset_requested = true,
                         _ => {}
                     }
                 }
@@ -621,9 +630,11 @@ scene.add(new THREE.HemisphereLight(0x87ceeb, 0xc2956b, 0.5));
 
 // ═══ DESERT GROUND ═══
 const sandMat = new THREE.MeshStandardMaterial({ color: 0xd4a860, roughness: 0.95, metalness: 0.02 });
+const GROUND_Y = -0.071;  // below landing gear feet (y=-0.068 minus foot radius)
 const floor = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), sandMat);
-floor.rotation.x = -Math.PI / 2; floor.position.y = -0.01; scene.add(floor);
+floor.rotation.x = -Math.PI / 2; floor.position.y = GROUND_Y; scene.add(floor);
 const grid = new THREE.GridHelper(50, 50, 0xc49850, 0xc49850);
+grid.position.y = GROUND_Y;
 grid.material.transparent = true; grid.material.opacity = 0.12;
 scene.add(grid);
 
@@ -648,7 +659,7 @@ scene.add(grid);
   });
   const plane = new THREE.Mesh(new THREE.PlaneGeometry(8, 1), mat);
   plane.rotation.x = -Math.PI / 2;
-  plane.position.set(0, 0.002, 4);
+  plane.position.set(0, GROUND_Y + 0.012, 1.5);
   scene.add(plane);
 }
 
@@ -666,7 +677,7 @@ const duneDarkMat = new THREE.MeshStandardMaterial({ color: 0xc49850, roughness:
     Math.random() > 0.5 ? duneMat : duneDarkMat
   );
   dune.scale.set(d.sx, d.sy, d.sz);
-  dune.position.set(d.x, -0.01, d.z);
+  dune.position.set(d.x, GROUND_Y, d.z);
   dune.rotation.y = d.ry;
   scene.add(dune);
 });
@@ -1212,6 +1223,7 @@ fn main() -> anyhow::Result<()> {
         let mut armed = false;
         let mut pkt_count = 0u64;
         let mut first_nonzero_motors = true;
+        let mut motor_rpms = [0.0f64; 4]; // persists across frames
 
         let recv_expected = unpack_codec.expected_size();
         eprintln!("Expecting {recv_expected}-byte receive packets on {}", udp_cfg.listen);
@@ -1220,12 +1232,25 @@ fn main() -> anyhow::Result<()> {
             let frame_start = Instant::now();
             input.poll();
 
-            // Drain all queued packets, keeping only the latest valid one.
-            // Use non-blocking mode so we don't stall when packets arrive
-            // faster than the timeout.
-            let mut motor_rpms = [0.0f64; 4];
-            let mut got_motors = false;
+            // Reset: gamepad A or keyboard R
+            if input.reset_requested {
+                input.reset_requested = false;
+                motor_rpms = [0.0; 4];
+                armed = false;
+                input.armed = false;
+                input.throttle = 0.0;
+                input.rc[2] = RC_MIN;
+                input.rc[4] = RC_MIN;
+                if let Err(e) = sil.reset() {
+                    eprintln!("[reset] error: {e}");
+                } else {
+                    eprintln!("[reset] simulation reset");
+                }
+            }
 
+            // Drain all queued packets, updating motor commands.
+            // motor_rpms persists — if no new packet arrives this frame,
+            // physics keeps stepping with the last known values.
             socket.set_nonblocking(true).ok();
             loop {
                 match socket.recv_from(&mut recv_buf) {
@@ -1241,7 +1266,12 @@ fn main() -> anyhow::Result<()> {
                                     values.get("omega_m4").copied().unwrap_or(0.0),
                                 ];
                                 armed = values.get("armed").copied().unwrap_or(0.0) != 0.0;
-                                got_motors = true;
+
+                                if first_nonzero_motors && motor_rpms.iter().any(|&m| m > 0.01) {
+                                    eprintln!("\r[udp] FIRST NON-ZERO MOTORS: [{:.1},{:.1},{:.1},{:.1}] armed={} t={:.4}    ",
+                                        motor_rpms[0], motor_rpms[1], motor_rpms[2], motor_rpms[3], armed, sil.time());
+                                    first_nonzero_motors = false;
+                                }
                             }
                         }
                     }
@@ -1249,21 +1279,11 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             socket.set_nonblocking(false).ok();
-            socket.set_read_timeout(Some(Duration::from_millis(100))).ok();
 
-            // Step physics if we got motor commands
-            if got_motors {
-                if first_nonzero_motors && motor_rpms.iter().any(|&m| m > 0.01) {
-                    eprintln!("\r[udp] FIRST NON-ZERO MOTORS: [{:.1},{:.1},{:.1},{:.1}] armed={} t={:.4}    ",
-                        motor_rpms[0], motor_rpms[1], motor_rpms[2], motor_rpms[3], armed, sil.time());
-                    first_nonzero_motors = false;
-                }
-
-                let target_clock = sil.time() + dt;
-                if let Err(e) = sil.receive_motors(motor_rpms, target_clock) {
-                    eprintln!("\r[udp] Step error: {e}");
-                }
-                pkt_count += 1;
+            // Always step physics with latest motor values
+            let target_clock = sil.time() + dt;
+            if let Err(e) = sil.receive_motors(motor_rpms, target_clock) {
+                eprintln!("\r[udp] Step error: {e}");
             }
 
             // Always send sensor data so cerebri doesn't starve
@@ -1273,7 +1293,7 @@ fn main() -> anyhow::Result<()> {
             let _ = socket.send_to(&buf, &udp_cfg.send);
 
             // Status logging
-            if pkt_count % 250 == 0 && pkt_count > 0 && got_motors {
+            if pkt_count > 0 && pkt_count % 250 == 0 {
                 eprintln!(
                     "\r[udp] t={:.1}s alt={:.2}m motors=[{:.0},{:.0},{:.0},{:.0}] armed={} rc=[{},{},{},{},arm={}] input={}    ",
                     sensors.clock_sec,
@@ -1286,7 +1306,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             // Viz update
-            let mode_str = if got_motors {
+            let mode_str = if pkt_count > 0 {
                 format!("UDP ({}, {})", if armed { "ARMED" } else { "disarmed" }, input.mode_name())
             } else {
                 format!("UDP (waiting, {})", input.mode_name())
@@ -1317,6 +1337,19 @@ fn main() -> anyhow::Result<()> {
         loop {
             let frame_start = Instant::now();
             input.poll();
+
+            if input.reset_requested {
+                input.reset_requested = false;
+                input.armed = false;
+                input.throttle = 0.0;
+                input.rc[2] = RC_MIN;
+                input.rc[4] = RC_MIN;
+                if let Err(e) = sil.reset() {
+                    eprintln!("[reset] error: {e}");
+                } else {
+                    eprintln!("[reset] simulation reset");
+                }
+            }
 
             let motor_rpms = [0.0; 4];
             let target_clock = sil.time() + dt;

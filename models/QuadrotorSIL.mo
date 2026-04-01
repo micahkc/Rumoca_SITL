@@ -14,14 +14,23 @@ model QuadrotorSIL
 
   // --- Physical parameters ---
   parameter Real mass = 2.0 "Total mass [kg]";
-  parameter Real g = 9.80665 "Gravity [m/s^2]";
-  parameter Real Ixx = 0.020 "Roll moment of inertia [kg*m^2]";
-  parameter Real Iyy = 0.020 "Pitch moment of inertia [kg*m^2]";
-  parameter Real Izz = 0.040 "Yaw moment of inertia [kg*m^2]";
-  parameter Real Ct = 8.5e-6 "Thrust coefficient [N/(rad/s)^2]";
-  parameter Real Cm = 1.36e-7 "Torque coefficient [N*m/(rad/s)^2]";
-  parameter Real arm_length = 0.2 "Arm length [m]";
-  parameter Real d = arm_length * 0.7071067811865476 "Effective moment arm [m]";
+  parameter Real g = 9.8 "Gravity [m/s^2]";
+  parameter Real Ixx = 0.02166666666666667 "Roll moment of inertia [kg*m^2]";
+  parameter Real Iyy = 0.02166666666666667 "Pitch moment of inertia [kg*m^2]";
+  parameter Real Izz = 0.04000000000000001 "Yaw moment of inertia [kg*m^2]";
+  parameter Real Ct = 8.54858e-6 "Thrust coefficient [N/(rad/s)^2]";
+  parameter Real Cm = 0.016 "Torque coefficient [N*m/(rad/s)^2]";
+  parameter Real arm_length = 0.25 "Arm length [m]";
+  parameter Real d = arm_length * 0.7071067811865476 "Effective moment arm [m]"; // X config, matches cyecca
+    // Additional aerodynamic parameters from cyecca (not used in original equations, but included for completeness)
+    parameter Real CD0 = 0 "Zero-lift drag coefficient";
+    parameter Real S = 0.1 "Reference area [m^2]";
+    parameter Real rho = 1.225 "Air density [kg/m^3]";
+    parameter Real Jxz = 0.0 "Product of inertia [kg*m^2]";
+    // Motor directions and angles (for completeness, not used in original equations)
+    parameter Integer dir_motor[4] = {1, 1, -1, -1} "Motor directions (1=CCW, -1=CW)";
+    parameter Real theta_motor[4] = {-3.141592653589793/4, 3*3.141592653589793/4, 3.141592653589793/4, -3*3.141592653589793/4} "Motor angles [rad]";
+    parameter Real l_motor[4] = {arm_length, arm_length, arm_length, arm_length} "Arm lengths [m]";
   parameter Real mag_world_n = 0.21 "Mag field North [Gauss]";
   parameter Real mag_world_e = 0.0 "Mag field East [Gauss]";
   parameter Real mag_world_d = 0.45 "Mag field Down [Gauss]";
@@ -57,9 +66,9 @@ model QuadrotorSIL
 
   // --- Outputs (sensor readings, computed from state) ---
   // These are algebraic but trivially eliminable
-  output Real accel_x "Body accelerometer X [m/s^2]";
-  output Real accel_y "Body accelerometer Y [m/s^2]";
-  output Real accel_z "Body accelerometer Z [m/s^2]";
+  output Real accel_x "Body accelerometer X [m/s^2] (specific force)";
+  output Real accel_y "Body accelerometer Y [m/s^2] (specific force)";
+  output Real accel_z "Body accelerometer Z [m/s^2] (specific force)";
   output Real gyro_x "Body gyroscope X [rad/s]";
   output Real gyro_y "Body gyroscope Y [rad/s]";
   output Real gyro_z "Body gyroscope Z [rad/s]";
@@ -79,6 +88,8 @@ protected
   Real a_bz "Body Z acceleration (thrust/mass)";
   // Ground contact: force in NED Down direction (negative = pushes up)
   Real F_ground "Ground normal force [N] (in NED Down, negative=up)";
+  // World-frame total acceleration (NED)
+  Real a_wx; Real a_wy; Real a_wz;
 
 equation
   // Motor thrusts
@@ -115,6 +126,10 @@ equation
   der(vx) = R13 * a_bz;
   der(vy) = R23 * a_bz;
   der(vz) = R33 * a_bz + g + F_ground / mass;
+  // Compute world-frame total acceleration (NED)
+  a_wx = der(vx);
+  a_wy = der(vy);
+  a_wz = der(vz);
 
   // --- Quaternion kinematics (with Baumgarte stabilization) ---
   // The correction term -lambda*(|q|^2-1)*q drives the quaternion
@@ -133,9 +148,10 @@ equation
   gyro_x = omega_x;
   gyro_y = omega_y;
   gyro_z = omega_z;
-  accel_x = 0;
-  accel_y = 0;
-  accel_z = a_bz;
+  // Accelerometer: specific force in body frame (remove gravity, rotate to body)
+  accel_x = R11 * (a_wx - g) + R21 * a_wy + R31 * a_wz;
+  accel_y = R12 * (a_wx - g) + R22 * a_wy + R32 * a_wz;
+  accel_z = R13 * (a_wx - g) + R23 * a_wy + R33 * a_wz;
   // mag_body = R^T * mag_world
   mag_x = R11 * mag_world_n + R21 * mag_world_e + R31 * mag_world_d;
   mag_y = R12 * mag_world_n + R22 * mag_world_e + R32 * mag_world_d;
